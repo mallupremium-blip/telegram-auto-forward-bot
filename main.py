@@ -171,6 +171,9 @@ line or ""
 ))
 
 
+# =========================
+# ARRANGE MODE STYLE
+# =========================
 def build_links(links):
 links = unique_keep_order(links)
 
@@ -185,6 +188,9 @@ result.append(f"VIDEO {i}\n{link}")
 return "\n\n".join(result).strip()
 
 
+# =========================
+# TEXT EDIT / MIDDLE MODE STYLE
+# =========================
 def build_links_simple(links):
 links = unique_keep_order(links)
 
@@ -281,10 +287,8 @@ if user_data[uid]["middle_mode"]:
 mal = middle_text_filter(text)
 
 parts = []
-
 if mal:
 parts.append("\n".join(mal))
-
 if links:
 parts.append(build_links_simple(links))
 
@@ -313,62 +317,34 @@ try:
 return bot.send_message(chat_id, safe_text(text), reply_markup=reply_markup)
 except Exception as e:
 logging.error(f"Send message error to {chat_id}: {e}")
-return None
 
 
 def send_photo_safe(chat_id, photo, caption="", reply_markup=None):
 try:
-return bot.send_photo(
-chat_id,
-photo,
-caption=safe_caption(caption),
-reply_markup=reply_markup
-)
+return bot.send_photo(chat_id, photo, caption=safe_caption(caption), reply_markup=reply_markup)
 except Exception as e:
 logging.error(f"Send photo error to {chat_id}: {e}")
-return None
 
 
 def send_video_safe(chat_id, video, caption="", reply_markup=None):
 try:
-return bot.send_video(
-chat_id,
-video,
-caption=safe_caption(caption),
-reply_markup=reply_markup
-)
+return bot.send_video(chat_id, video, caption=safe_caption(caption), reply_markup=reply_markup)
 except Exception as e:
 logging.error(f"Send video error to {chat_id}: {e}")
-return None
 
 
 def send_document_safe(chat_id, document, caption="", reply_markup=None):
 try:
-return bot.send_document(
-chat_id,
-document,
-caption=safe_caption(caption),
-reply_markup=reply_markup
-)
+return bot.send_document(chat_id, document, caption=safe_caption(caption), reply_markup=reply_markup)
 except Exception as e:
 logging.error(f"Send document error to {chat_id}: {e}")
-return None
 
 
 def send_animation_safe(chat_id, animation, caption="", reply_markup=None):
 try:
-return bot.send_animation(
-chat_id,
-animation,
-caption=safe_caption(caption),
-reply_markup=reply_markup
-)
+return bot.send_animation(chat_id, animation, caption=safe_caption(caption), reply_markup=reply_markup)
 except Exception as e:
-logging.error(f"Send animation error to {chat_id}: {e}")
-return None
-
-
-def report_forward_error(uid, channel_id, err):
+logging.error(f"Send animation error to {chat_id}: {e}")def report_forward_error(uid, channel_id, err):
 send_message_safe(
 uid,
 f"⚠️ Forward failed\nChannel: {channel_id}\nError: {err}",
@@ -519,11 +495,7 @@ action = user_data[uid]["thumb_action"]
 if action == "set":
 user_data[uid]["waiting_thumb"] = slot
 save_data()
-send_message_safe(
-m.chat.id,
-f"{slot} ലേക്ക് save ചെയ്യാൻ photo അയക്കൂ 📸",
-reply_markup=slot_kb()
-)
+send_message_safe(m.chat.id, f"{slot} ലേക്ക് save ചെയ്യാൻ photo അയക്കൂ 📸", reply_markup=slot_kb())
 return
 
 if action == "use":
@@ -776,4 +748,160 @@ send_message_safe(m.chat.id, text, reply_markup=main_kb())
 
 
 @bot.message_handler(content_types=["photo"])
-def photo_han
+def photo_handler(m):
+uid = m.from_user.id
+if not is_admin(uid):
+return
+
+init_user(uid)
+
+try:
+photo_id = m.photo[-1].file_id
+caption = m.caption or ""
+
+if user_data[uid]["waiting_thumb"]:
+slot = user_data[uid]["waiting_thumb"]
+user_data[uid]["thumbs"][slot] = photo_id
+user_data[uid]["waiting_thumb"] = None
+user_data[uid]["thumb_action"] = None
+save_data()
+send_message_safe(m.chat.id, f"{slot} saved ✅", reply_markup=main_kb())
+return
+
+send_photo_id = get_thumb(uid) if user_data[uid]["thumb_mode"] else photo_id
+if not send_photo_id:
+send_photo_id = photo_id
+
+final_caption = apply_processing(uid, caption)
+
+send_photo_safe(m.chat.id, send_photo_id, caption=final_caption, reply_markup=main_kb())
+forward_to_channels_photo(uid, send_photo_id, final_caption)
+
+except Exception as e:
+logging.error(f"Photo handler error: {e}")
+send_message_safe(m.chat.id, "Photo process ചെയ്യാൻ പറ്റിയില്ല ❌", reply_markup=main_kb())
+
+
+@bot.message_handler(content_types=["video"])
+def video_handler(m):
+uid = m.from_user.id
+if not is_admin(uid):
+return
+
+init_user(uid)
+
+try:
+video_id = m.video.file_id
+caption = m.caption or ""
+final_caption = apply_processing(uid, caption)
+
+send_video_safe(m.chat.id, video_id, caption=final_caption, reply_markup=main_kb())
+forward_to_channels_video(uid, video_id, final_caption)
+
+except Exception as e:
+logging.error(f"Video handler error: {e}")
+send_message_safe(m.chat.id, "Video process ചെയ്യാൻ പറ്റിയില്ല ❌", reply_markup=main_kb())
+
+
+@bot.message_handler(content_types=["document"])
+def document_handler(m):
+uid = m.from_user.id
+if not is_admin(uid):
+return
+
+init_user(uid)
+
+try:
+doc_id = m.document.file_id
+caption = m.caption or ""
+final_caption = apply_processing(uid, caption)
+
+send_document_safe(m.chat.id, doc_id, caption=final_caption, reply_markup=main_kb())
+forward_to_channels_document(uid, doc_id, final_caption)
+
+except Exception as e:
+logging.error(f"Document handler error: {e}")
+send_message_safe(m.chat.id, "Document process ചെയ്യാൻ പറ്റിയില്ല ❌", reply_markup=main_kb())
+
+
+@bot.message_handler(content_types=["animation"])
+def animation_handler(m):
+uid = m.from_user.id
+if not is_admin(uid):
+return
+
+init_user(uid)
+
+try:
+anim_id = m.animation.file_id
+caption = m.caption or ""
+final_caption = apply_processing(uid, caption)
+
+send_animation_safe(m.chat.id, anim_id, caption=final_caption, reply_markup=main_kb())
+forward_to_channels_animation(uid, anim_id, final_caption)
+
+except Exception as e:
+logging.error(f"Animation handler error: {e}")
+send_message_safe(m.chat.id, "Animation process ചെയ്യാൻ പറ്റിയില്ല ❌", reply_markup=main_kb())
+
+
+@bot.message_handler(content_types=["text"])
+def text_handler(m):
+uid = m.from_user.id
+if not is_admin(uid):
+return
+
+init_user(uid)
+
+ignore = {
+"📸 Set Thumb", "✅ Use Thumb",
+"🖼 Thumb ON", "🖼 Thumb OFF",
+"🔗 Arrange ON", "🔗 Arrange OFF",
+"📝 Text Edit ON", "📝 Text Edit OFF",
+"🎯 Middle ON", "🎯 Middle OFF",
+"📢 Select Channel",
+"🟢 Auto Forward ON", "🔴 Auto Forward OFF",
+"👁 Current Thumb", "📊 Current Settings",
+"Channel 1", "Channel 2", "Channel 3", "Channel 4", "Channel 5",
+"✅ Done", "🗑 Clear Channels", "⬅️ Back",
+"Photo 1", "Photo 2", "Photo 3", "Photo 4",
+}
+
+if m.text in ignore:
+return
+
+try:
+final_text = apply_processing(uid, m.text)
+
+send_message_safe(
+m.chat.id,
+final_text if final_text else "Empty text ❌",
+reply_markup=main_kb()
+)
+
+if final_text:
+forward_to_channels_text(uid, final_text)
+
+except Exception as e:
+logging.error(f"Text handler error: {e}")
+send_message_safe(m.chat.id, "Text process ചെയ്യാൻ പറ്റിയില്ല ❌", reply_markup=main_kb())
+
+
+def run_bot():
+while True:
+try:
+logging.info("Bot running...")
+bot.remove_webhook()
+bot.infinity_polling(
+skip_pending=True,
+timeout=30,
+long_polling_timeout=30
+)
+except Exception as e:
+logging.error(f"Polling crash: {e}")
+time.sleep(5)
+
+
+if __name__ == "__main__":
+load_data()
+run_bot()
