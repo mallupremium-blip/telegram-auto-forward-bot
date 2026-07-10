@@ -9,8 +9,9 @@ import logging
 from telebot import types
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 if not BOT_TOKEN:
-raise ValueError("BOT_TOKEN not set")
+    raise ValueError("BOT_TOKEN not set")
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
 
