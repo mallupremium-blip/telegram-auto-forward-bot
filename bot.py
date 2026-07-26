@@ -205,7 +205,7 @@ def build_links(links):
     links = unique_keep_order(links)
     if not links:
         return ""
-    result = ["FULL VIDEO\n"]
+    result = ["FULL VIDEO 🍿\n"]
     for i, link in enumerate(links, 1):
         result.append(f"VIDEO {i}\n{link}")
     return "\n\n".join(result).strip()
@@ -465,14 +465,14 @@ def forward_to_channels_animation(uid, animation, caption=""):
 
 def main_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("Set Thumb", "Use Thumb")
-    kb.row("Thumb ON", "Thumb OFF")
-    kb.row("Arrange ON", "Arrange OFF")
-    kb.row("Text Edit ON", "Text Edit OFF")
-    kb.row("Middle ON", "Middle OFF")
-    kb.row("Select Channel")
-    kb.row("Auto Forward ON", "Auto Forward OFF")
-    kb.row("Current Thumb", "Current Settings")
+    kb.row("⚙️ Set Thumb", "🖼️ Use Thumb")
+    kb.row("🖼️ Thumb ON", "❌ Thumb OFF")
+    kb.row("🔄 Arrange ON", "❌ Arrange OFF")
+    kb.row("📝 Text Edit ON", "❌ Text Edit OFF")
+    kb.row("✂️ Middle ON", "❌ Middle OFF")
+    kb.row("📢 Select Channel")
+    kb.row("📤 Auto Forward ON", "❌ Auto Forward OFF")
+    kb.row("🖼️ Current Thumb", "📌 Current Settings")
     return kb
 
 
@@ -480,7 +480,7 @@ def slot_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("Photo 1", "Photo 2")
     kb.row("Photo 3", "Photo 4")
-    kb.row("Back")
+    kb.row("🔙 Back")
     return kb
 
 
@@ -489,8 +489,8 @@ def channel_kb():
     kb.row("Channel 1", "Channel 2")
     kb.row("Channel 3", "Channel 4")
     kb.row("Channel 5")
-    kb.row("Done", "Clear Channels")
-    kb.row("Back")
+    kb.row("✅ Done", "🧹 Clear Channels")
+    kb.row("🔙 Back")
     return kb
 
 
@@ -518,7 +518,7 @@ def start(m):
     )
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Set Thumb")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "⚙️ Set Thumb")
 def set_thumb(m):
     if is_duplicate_msg(m):
         return
@@ -532,7 +532,7 @@ def set_thumb(m):
     send_message_safe(m.chat.id, "Save slot select 👇", reply_markup=slot_kb())
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Use Thumb")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🖼️ Use Thumb")
 def use_thumb(m):
     if is_duplicate_msg(m):
         return
@@ -579,7 +579,7 @@ def thumb_slot(m):
     send_message_safe(m.chat.id, "Set/Use Thumb തിരഞ്ഞെടുക്കൂ 👆", reply_markup=main_kb())
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Current Thumb")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🖼️ Current Thumb")
 def current_thumb(m):
     if is_duplicate_msg(m):
         return
@@ -595,7 +595,7 @@ def current_thumb(m):
     send_photo_safe(m.chat.id, thumb, caption=f"Current Thumb: {slot} ✅", reply_markup=main_kb())
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Thumb ON")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🖼️ Thumb ON")
 def thumb_on(m):
     if is_duplicate_msg(m):
         return
@@ -612,7 +612,7 @@ def thumb_on(m):
     reply_safe(m, "Thumb ON ✅")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Thumb OFF")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "❌ Thumb OFF")
 def thumb_off(m):
     if is_duplicate_msg(m):
         return
@@ -626,7 +626,7 @@ def thumb_off(m):
     reply_safe(m, "Thumb OFF ❌")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Arrange ON")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🔄 Arrange ON")
 def arrange_on(m):
     if is_duplicate_msg(m):
         return
@@ -642,7 +642,7 @@ def arrange_on(m):
     reply_safe(m, "Arrange ON ✅")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Arrange OFF")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "❌ Arrange OFF")
 def arrange_off(m):
     if is_duplicate_msg(m):
         return
@@ -656,7 +656,7 @@ def arrange_off(m):
     reply_safe(m, "Arrange OFF ❌")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Text Edit ON")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "📝 Text Edit ON")
 def text_edit_on(m):
     if is_duplicate_msg(m):
         return
@@ -672,7 +672,7 @@ def text_edit_on(m):
     reply_safe(m, "Text Edit ON ✅")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Text Edit OFF")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "❌ Text Edit OFF")
 def text_edit_off(m):
     if is_duplicate_msg(m):
         return
@@ -686,7 +686,7 @@ def text_edit_off(m):
     reply_safe(m, "Text Edit OFF ❌")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Middle ON")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "✂️ Middle ON")
 def middle_on(m):
     if is_duplicate_msg(m):
         return
@@ -702,7 +702,7 @@ def middle_on(m):
     reply_safe(m, "Middle ON ✅")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Middle OFF")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "❌ Middle OFF")
 def middle_off(m):
     if is_duplicate_msg(m):
         return
@@ -716,7 +716,7 @@ def middle_off(m):
     reply_safe(m, "Middle OFF ❌")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Select Channel")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "📢 Select Channel")
 def select_channel(m):
     if is_duplicate_msg(m):
         return
@@ -747,7 +747,7 @@ def toggle_channel(m):
     send_message_safe(m.chat.id, msg_text, reply_markup=channel_kb())
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Done")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "✅ Done")
 def done_channels(m):
     if is_duplicate_msg(m):
         return
@@ -757,7 +757,7 @@ def done_channels(m):
     send_message_safe(m.chat.id, "Channels saved ✅", reply_markup=main_kb())
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Clear Channels")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🧹 Clear Channels")
 def clear_channels(m):
     if is_duplicate_msg(m):
         return
@@ -771,7 +771,7 @@ def clear_channels(m):
     send_message_safe(m.chat.id, "Channels cleared 🧹", reply_markup=channel_kb())
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Back")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🔙 Back")
 def back_btn(m):
     if is_duplicate_msg(m):
         return
@@ -781,7 +781,7 @@ def back_btn(m):
     send_message_safe(m.chat.id, "Main menu 🔙", reply_markup=main_kb())
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Auto Forward ON")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "📤 Auto Forward ON")
 def auto_forward_on(m):
     if is_duplicate_msg(m):
         return
@@ -798,7 +798,7 @@ def auto_forward_on(m):
     reply_safe(m, "Auto Forward ON ✅")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Auto Forward OFF")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "❌ Auto Forward OFF")
 def auto_forward_off(m):
     if is_duplicate_msg(m):
         return
@@ -812,7 +812,7 @@ def auto_forward_off(m):
     reply_safe(m, "Auto Forward OFF ❌")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Current Settings")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "📌 Current Settings")
 def current_settings(m):
     if is_duplicate_msg(m):
         return
@@ -933,15 +933,15 @@ def text_handler(m):
         return
     init_user(uid)
     ignore = {
-        "Set Thumb", "Use Thumb",
-        "Thumb ON", "Thumb OFF",
-        "Arrange ON", "Arrange OFF",
-        "Text Edit ON", "Text Edit OFF",
-        "Middle ON", "Middle OFF",
-        "Select Channel", "Auto Forward ON", "Auto Forward OFF",
-        "Current Thumb", "Current Settings",
+        "⚙️ Set Thumb", "🖼️ Use Thumb",
+        "🖼️ Thumb ON", "❌ Thumb OFF",
+        "🔄 Arrange ON", "❌ Arrange OFF",
+        "📝 Text Edit ON", "❌ Text Edit OFF",
+        "✂️ Middle ON", "❌ Middle OFF",
+        "📢 Select Channel", "📤 Auto Forward ON", "❌ Auto Forward OFF",
+        "🖼️ Current Thumb", "📌 Current Settings",
         "Channel 1", "Channel 2", "Channel 3", "Channel 4", "Channel 5",
-        "Done", "Clear Channels", "Back",
+        "✅ Done", "🧹 Clear Channels", "🔙 Back",
         "Photo 1", "Photo 2", "Photo 3", "Photo 4",
     }
     if m.text in ignore:
@@ -985,4 +985,3 @@ def run_bot():
 if __name__ == "__main__":
     load_data()
     run_bot()
-
