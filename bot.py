@@ -7,7 +7,6 @@ import telebot
 import threading
 import logging
 import gc
-import psutil
 from telebot import types
 from telebot.apihelper import ApiTelegramException
 
@@ -65,7 +64,7 @@ STATS = {
     "errors": 0
 }
 
-# Pre-compiled Regex Patterns for High Performance
+# Pre-compiled Regex Patterns
 URL_PATTERN = re.compile(r'https?://[^\s<>()"]+')
 MALAYALAM_PATTERN = re.compile(r"[\u0D00-\u0D7F]")
 SYMBOLS_EMOJI_PATTERN = re.compile(r"[\W_]+")
@@ -83,6 +82,7 @@ PROMO_WORDS = frozenset([
 IGNORE_COMMANDS = frozenset({
     "⚙️ Set Thumb", "🖼️ Use Thumb",
     "🖼️ Thumb ON", "❌ Thumb OFF",
+    "🖼️ Photo ON", "❌ Photo OFF",
     "🔄 Arrange ON", "❌ Arrange OFF",
     "📝 Text Edit ON", "❌ Text Edit OFF",
     "✂️ Middle ON", "❌ Middle OFF",
@@ -94,7 +94,6 @@ IGNORE_COMMANDS = frozenset({
     "🧪 Test Channels"
 })
 
-# --- METRICS & DUP PROTECTION HELPERS ---
 def increment_stat(key, count=1):
     with stats_lock:
         STATS[key] = STATS.get(key, 0) + count
@@ -107,7 +106,6 @@ def is_duplicate_msg(m):
         if msg_key in processed_messages:
             return True
         processed_messages.add(msg_key)
-        # Periodic memory cleanup for duplicate tracking set
         if len(processed_messages) > 10000:
             to_remove = list(processed_messages)[:5000]
             for k in to_remove:
@@ -116,7 +114,6 @@ def is_duplicate_msg(m):
     return False
 
 def auto_cleanup():
-    """Periodically cleans garbage and trims duplicate sets to keep memory usage extremely low."""
     with processed_lock:
         if len(processed_messages) > 5000:
             to_remove = list(processed_messages)[:2500]
@@ -124,10 +121,10 @@ def auto_cleanup():
                 processed_messages.discard(k)
     gc.collect()
 
-# --- STATE MANAGEMENT ---
 def default_user_state():
     return {
         "thumb_mode": False,
+        "photo_mode": False,
         "arrange_mode": False,
         "text_edit_mode": False,
         "middle_mode": False,
@@ -140,7 +137,6 @@ def default_user_state():
     }
 
 def save_data():
-    """Atomic write operation to prevent data loss or corruption during power loss or crashes."""
     try:
         with data_lock:
             serializable = {str(k): v for k, v in user_data.items()}
@@ -155,7 +151,7 @@ def save_data():
                     logging.warning(f"Backup copy failure: {e}")
             os.replace(TEMP_FILE, DATA_FILE)
     except Exception as e:
-        logging.error(f"Error during atomic save_data: {e}")
+        logging.error(f"Error during save_data: {e}")
         increment_stat("errors")
 
 def load_data():
@@ -169,7 +165,7 @@ def load_data():
                     raw = json.load(f)
                 target_path = DATA_FILE
             except Exception as e:
-                logging.error(f"Failed loading main data file {DATA_FILE}: {e}")
+                logging.error(f"Failed loading main file {DATA_FILE}: {e}")
 
         if raw is None and os.path.exists(BACKUP_FILE):
             try:
@@ -177,7 +173,7 @@ def load_data():
                     raw = json.load(f)
                 target_path = BACKUP_FILE
             except Exception as e:
-                logging.error(f"Failed loading backup data file {BACKUP_FILE}: {e}")
+                logging.error(f"Failed loading backup file {BACKUP_FILE}: {e}")
 
         if raw is None:
             with data_lock:
@@ -205,9 +201,9 @@ def load_data():
 
         with data_lock:
             user_data = fixed
-        logging.info(f"User data successfully loaded from {target_path}")
+        logging.info(f"User data loaded from {target_path}")
     except Exception as e:
-        logging.error(f"Fatal error loading state data: {e}")
+        logging.error(f"Error loading data: {e}")
         with data_lock:
             user_data = {}
 
@@ -221,7 +217,6 @@ def init_user(uid):
                 user_data[uid] = default_user_state()
         save_data()
 
-# --- OPTIMIZED TEXT & LINK PROCESSING ---
 def safe_text(text):
     return (text or "")[:4096]
 
@@ -347,9 +342,7 @@ def selected_channel_names(uid):
         selected = user_data.get(uid, {}).get("selected_channels", [])
     return [name for name, cid in CHANNELS.items() if cid in selected]
 
-# --- NETWORK & RETRY HANDLING ---
 def api_call_retry(func, *args, **kwargs):
-    """Network wrapper with auto exponential backoff for FloodWait, timeouts, and connection errors."""
     max_retries = 5
     for attempt in range(max_retries):
         try:
@@ -364,21 +357,14 @@ def api_call_retry(func, *args, **kwargs):
                 logging.warning(f"Telegram FloodWait 429: Retrying after {retry_after}s")
                 time.sleep(retry_after + 1)
             elif e.error_code in (500, 502, 503, 504):
-                logging.warning(f"Telegram Server Error {e.error_code}. Retry {attempt + 1}/{max_retries}")
                 time.sleep(2 * (attempt + 1))
             else:
-                logging.error(f"ApiTelegramException in {func.__name__}: {e}")
                 increment_stat("errors")
                 raise e
-        except (ConnectionResetError, TimeoutError, OSError) as e:
-            logging.warning(f"Network glitch in {func.__name__}: {e}. Retrying ({attempt + 1}/{max_retries})...")
-            time.sleep(2 * (attempt + 1))
         except Exception as e:
             if attempt < max_retries - 1:
-                logging.warning(f"Network error in {func.__name__}: {e}. Retrying ({attempt + 1}/{max_retries})...")
                 time.sleep(2 * (attempt + 1))
             else:
-                logging.error(f"Final error limit hit in {func.__name__}: {e}")
                 increment_stat("errors")
                 raise e
     return None
@@ -387,48 +373,43 @@ def send_message_safe(chat_id, text, reply_markup=None):
     try:
         return api_call_retry(bot.send_message, chat_id, safe_text(text), reply_markup=reply_markup)
     except Exception as e:
-        logging.error(f"send_message_safe failure to {chat_id}: {e}")
+        logging.error(f"send_message_safe failure: {e}")
         return None
 
 def reply_safe(m, text, reply_markup=None):
     try:
         return api_call_retry(bot.reply_to, m, safe_text(text), reply_markup=reply_markup)
     except Exception as e:
-        logging.warning(f"Reply error, falling back to send_message_safe: {e}")
         return send_message_safe(m.chat.id, text, reply_markup=reply_markup)
 
 def send_photo_safe(chat_id, photo, caption="", reply_markup=None):
     try:
         return api_call_retry(bot.send_photo, chat_id, photo, caption=safe_caption(caption), reply_markup=reply_markup)
     except Exception as e:
-        logging.error(f"send_photo_safe failure to {chat_id}: {e}")
+        logging.error(f"send_photo_safe failure: {e}")
         return None
 
 def send_video_safe(chat_id, video, caption="", reply_markup=None):
     try:
         return api_call_retry(bot.send_video, chat_id, video, caption=safe_caption(caption), reply_markup=reply_markup)
     except Exception as e:
-        logging.error(f"send_video_safe failure to {chat_id}: {e}")
         return None
 
 def send_document_safe(chat_id, document, caption="", reply_markup=None):
     try:
         return api_call_retry(bot.send_document, chat_id, document, caption=safe_caption(caption), reply_markup=reply_markup)
     except Exception as e:
-        logging.error(f"send_document_safe failure to {chat_id}: {e}")
         return None
 
 def send_animation_safe(chat_id, animation, caption="", reply_markup=None):
     try:
         return api_call_retry(bot.send_animation, chat_id, animation, caption=safe_caption(caption), reply_markup=reply_markup)
     except Exception as e:
-        logging.error(f"send_animation_safe failure to {chat_id}: {e}")
         return None
 
 def report_forward_error(uid, channel_id, err):
     send_message_safe(uid, f"⚠️ Forward failed\nChannel: {channel_id}\nError: {err}", reply_markup=main_kb())
 
-# --- FORWARDING LOGIC ---
 def _generic_forward(uid, media_or_text, send_fn, caption=None):
     with data_lock:
         state = user_data.get(uid, {})
@@ -469,6 +450,7 @@ def main_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("⚙️ Set Thumb", "🖼️ Use Thumb")
     kb.row("🖼️ Thumb ON", "❌ Thumb OFF")
+    kb.row("🖼️ Photo ON", "❌ Photo OFF")
     kb.row("🔄 Arrange ON", "❌ Arrange OFF")
     kb.row("📝 Text Edit ON", "❌ Text Edit OFF")
     kb.row("✂️ Middle ON", "❌ Middle OFF")
@@ -494,7 +476,7 @@ def channel_kb():
     kb.row("🔙 Back")
     return kb
 
-# --- ADMIN COMMANDS & NEW FEATURES ---
+# --- ADMIN COMMANDS ---
 @bot.message_handler(commands=["stats"])
 def stats_command(m):
     if is_duplicate_msg(m):
@@ -509,9 +491,6 @@ def stats_command(m):
     days, hours = divmod(hours, 24)
     uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
 
-    process = psutil.Process(os.getpid())
-    ram_mb = process.memory_info().rss / (1024 * 1024)
-
     with stats_lock:
         f_msgs = STATS.get("forwarded_messages", 0)
         p_msgs = STATS.get("processed_messages", 0)
@@ -520,7 +499,6 @@ def stats_command(m):
     msg = (
         "📊 **Bot Operational Metrics**\n\n"
         f"⏱️ **Uptime:** {uptime_str}\n"
-        f"💾 **RAM Usage:** {ram_mb:.2f} MB\n"
         f"📩 **Processed Messages:** {p_msgs}\n"
         f"📤 **Forwarded Messages:** {f_msgs}\n"
         f"⚠️ **Errors Handled:** {errs}"
@@ -532,36 +510,8 @@ def health_check(m):
     if is_duplicate_msg(m):
         return
     if is_admin(m.from_user.id):
-        reply_safe(m, "🟢 **System Healthy**: Engine active, database synced, Railway connection operational.")
+        reply_safe(m, "🟢 **System Healthy**: Engine active, database synced.")
 
-@bot.message_handler(commands=["backup"])
-def manual_backup(m):
-    if is_duplicate_msg(m):
-        return
-    if not is_admin(m.from_user.id):
-        return
-    save_data()
-    if os.path.exists(DATA_FILE):
-        send_document_safe(m.chat.id, open(DATA_FILE, "rb"), caption="💾 Manual Data Backup")
-
-@bot.message_handler(commands=["restore"])
-def manual_restore(m):
-    if is_duplicate_msg(m):
-        return
-    if not is_admin(m.from_user.id):
-        return
-    if m.reply_to_message and m.reply_to_message.document:
-        try:
-            file_info = bot.get_file(m.reply_to_message.document.file_id)
-            downloaded = bot.download_file(file_info.file_path)
-            with open(DATA_FILE, "wb") as f:
-                f.write(downloaded)
-            load_data()
-            reply_safe(m, "✅ Data successfully restored and synchronized!")
-        except Exception as e:
-            reply_safe(m, f"❌ Failed to restore database: {e}")
-
-# --- BOT MESSAGE HANDLERS ---
 @bot.message_handler(commands=["start"])
 def start(m):
     if is_duplicate_msg(m):
@@ -628,11 +578,7 @@ def thumb_slot(m):
         with data_lock:
             user_data[uid]["waiting_thumb"] = slot
         save_data()
-        send_message_safe(
-            m.chat.id,
-            f"📸 {slot} ലേക്ക് save ചെയ്യാൻ photo അയക്കൂ",
-            reply_markup=slot_kb()
-        )
+        send_message_safe(m.chat.id, f"📸 {slot} ലേക്ക് save ചെയ്യാൻ photo അയക്കൂ", reply_markup=slot_kb())
         return
     if action == "use":
         with data_lock:
@@ -694,6 +640,38 @@ def thumb_off(m):
         user_data[uid]["thumb_mode"] = False
     save_data()
     reply_safe(m, "Thumb OFF ❌")
+
+# --- PHOTO MODE HANDLERS ---
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🖼️ Photo ON")
+def photo_mode_on(m):
+    if is_duplicate_msg(m):
+        return
+    uid = m.from_user.id
+    if not is_admin(uid):
+        return
+    init_user(uid)
+    with data_lock:
+        selected = user_data[uid].get("selected_thumb")
+    if not selected:
+        send_message_safe(m.chat.id, "thumb select ചെയ്യൂ ❌", reply_markup=main_kb())
+        return
+    with data_lock:
+        user_data[uid]["photo_mode"] = True
+    save_data()
+    reply_safe(m, "Photo ON ✅")
+
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "❌ Photo OFF")
+def photo_mode_off(m):
+    if is_duplicate_msg(m):
+        return
+    uid = m.from_user.id
+    if not is_admin(uid):
+        return
+    init_user(uid)
+    with data_lock:
+        user_data[uid]["photo_mode"] = False
+    save_data()
+    reply_safe(m, "Photo OFF ❌")
 
 @bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🔄 Arrange ON")
 def arrange_on(m):
@@ -908,6 +886,7 @@ def current_settings(m):
     with data_lock:
         st = user_data[uid]
         thumb_mode = st['thumb_mode']
+        photo_mode = st.get('photo_mode', False)
         arrange_mode = st['arrange_mode']
         text_edit_mode = st['text_edit_mode']
         middle_mode = st['middle_mode']
@@ -916,6 +895,7 @@ def current_settings(m):
 
     text = (
         f"Thumb Mode: {'ON ✅' if thumb_mode else 'OFF ❌'}\n"
+        f"Photo Mode: {'ON ✅' if photo_mode else 'OFF ❌'}\n"
         f"Arrange Mode: {'ON ✅' if arrange_mode else 'OFF ❌'}\n"
         f"Text Edit Mode: {'ON ✅' if text_edit_mode else 'OFF ❌'}\n"
         f"Middle Mode: {'ON ✅' if middle_mode else 'OFF ❌'}\n"
@@ -962,7 +942,7 @@ def photo_handler(m):
         send_photo_safe(m.chat.id, send_photo_id, caption=final_caption, reply_markup=main_kb())
         forward_to_channels_photo(uid, send_photo_id, final_caption)
     except Exception as e:
-        logging.error(f"Photo handler processing error: {e}")
+        logging.error(f"Photo handler error: {e}")
         increment_stat("errors")
         send_message_safe(m.chat.id, "Photo process error ❌", reply_markup=main_kb())
 
@@ -981,7 +961,7 @@ def video_handler(m):
         send_video_safe(m.chat.id, video_id, caption=final_caption, reply_markup=main_kb())
         forward_to_channels_video(uid, video_id, final_caption)
     except Exception as e:
-        logging.error(f"Video handler processing error: {e}")
+        logging.error(f"Video handler error: {e}")
         increment_stat("errors")
         send_message_safe(m.chat.id, "Video process error ❌", reply_markup=main_kb())
 
@@ -1000,7 +980,7 @@ def document_handler(m):
         send_document_safe(m.chat.id, doc_id, caption=final_caption, reply_markup=main_kb())
         forward_to_channels_document(uid, doc_id, final_caption)
     except Exception as e:
-        logging.error(f"Document handler processing error: {e}")
+        logging.error(f"Document handler error: {e}")
         increment_stat("errors")
         send_message_safe(m.chat.id, "Document process error ❌", reply_markup=main_kb())
 
@@ -1019,7 +999,7 @@ def animation_handler(m):
         send_animation_safe(m.chat.id, anim_id, caption=final_caption, reply_markup=main_kb())
         forward_to_channels_animation(uid, anim_id, final_caption)
     except Exception as e:
-        logging.error(f"Animation handler processing error: {e}")
+        logging.error(f"Animation handler error: {e}")
         increment_stat("errors")
         send_message_safe(m.chat.id, "Animation process error ❌", reply_markup=main_kb())
 
@@ -1037,6 +1017,19 @@ def text_handler(m):
 
     try:
         final_text = apply_processing(uid, m.text)
+
+        with data_lock:
+            photo_mode = user_data[uid].get("photo_mode", False)
+
+        if photo_mode:
+            thumb_photo = get_thumb(uid)
+            if thumb_photo:
+                send_photo_safe(m.chat.id, thumb_photo, caption=final_text, reply_markup=main_kb())
+                forward_to_channels_photo(uid, thumb_photo, caption=final_text)
+                return
+            else:
+                send_message_safe(m.chat.id, "⚠️ Photo Mode ON ആണ്, പക്ഷെ Thumb Photo select ചെയ്തിട്ടില്ല! Normal text ആയി സെൻഡ് ചെയ്യുന്നു.", reply_markup=main_kb())
+
         send_message_safe(
             m.chat.id,
             final_text if final_text else "Empty text ❌",
@@ -1045,19 +1038,18 @@ def text_handler(m):
         if final_text:
             forward_to_channels_text(uid, final_text)
     except Exception as e:
-        logging.error(f"Text handler processing error: {e}")
+        logging.error(f"Text handler error: {e}")
         increment_stat("errors")
         send_message_safe(m.chat.id, "Text process error ❌", reply_markup=main_kb())
 
-# --- RUN ENGINE WITH RAILWAY AUTO-RECONNECT ---
+# --- RUN ENGINE ---
 def run_bot():
     backoff = 1
     logging.info("Starting Telegram Auto Forward Bot Engine...")
     
-    # Start periodic background garbage collector & cleanup worker thread
     def memory_cleanup_loop():
         while True:
-            time.sleep(1800)  # Every 30 minutes
+            time.sleep(1800)
             auto_cleanup()
 
     cleanup_thread = threading.Thread(target=memory_cleanup_loop, daemon=True)
