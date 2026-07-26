@@ -3,17 +3,21 @@ import re
 import json
 import time
 import shutil
-import random
 import telebot
 import threading
 import logging
 from telebot import types
+from telebot.apihelper import ApiTelegramException
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not set")
 
-bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=8)
+# Set telebot request timeouts
+telebot.apihelper.CONNECT_TIMEOUT = 15
+telebot.apihelper.READ_TIMEOUT = 30
+
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
 
 ADMIN_IDS = [6630347046, 7194569468]
 
@@ -31,25 +35,37 @@ DATA_FILE = "user_data.json"
 BACKUP_FILE = "user_data_backup.json"
 TEMP_FILE = "user_data.tmp"
 
+log_handlers = [logging.StreamHandler()]
+try:
+    log_handlers.append(logging.FileHandler("bot.log", encoding="utf-8"))
+except Exception:
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=log_handlers
 )
-logger = logging.getLogger(__name__)
 
 user_data = {}
 data_lock = threading.Lock()
-state_locks = {}
-state_locks_lock = threading.Lock()
-channel_lock = threading.Lock()
-send_lock = threading.Lock()
+processed_messages = set()
+processed_lock = threading.Lock()
 
-MAX_RETRIES = 5
-BASE_RETRY_DELAY = 1.5
+
+def is_duplicate_msg(m):
+    if not m or not hasattr(m, 'message_id') or not hasattr(m, 'chat'):
+        return False
+    msg_key = (m.chat.id, m.message_id)
+    with processed_lock:
+        if msg_key in processed_messages:
+            return True
+        processed_messages.add(msg_key)
+        if len(processed_messages) > 10000:
+            to_remove = list(processed_messages)[:5000]
+            for k in to_remove:
+                processed_messages.discard(k)
+    return False
 
 
 def default_user_state():
@@ -67,129 +83,88 @@ def default_user_state():
     }
 
 
-def get_state_lock(uid):
-    with state_locks_lock:
-        lock = state_locks.get(uid)
-        if lock is None:
-            lock = threading.RLock()
-            state_locks[uid] = lock
-        return lock
-
-
-def normalize_selected_channels(channels):
-    if not isinstance(channels, list):
-        return []
-    return unique_keep_order([cid for cid in channels if cid in CHANNELS.values()])
-
-
-def safe_api_call(func, *args, **kwargs):
-    last_err = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            with send_lock:
-                return func(*args, **kwargs)
-        except Exception as e:
-            last_err = e
-            msg = str(e)
-            if "FloodWait" in msg or "flood wait" in msg.lower():
-                wait_s = 5
-                m = re.search(r'(?i)flood\w*.*?(\d+)', msg)
-                if m:
-                    wait_s = int(m.group(1))
-                else:
-                    m2 = re.search(r'(?i)wait(?:ing)?\s*(\d+)', msg)
-                    if m2:
-                        wait_s = int(m2.group(1))
-                wait_s = min(max(wait_s, 1), 3600)
-                logging.warning(f"FloodWait detected. Sleeping {wait_s}s before retry.")
-                time.sleep(wait_s + 1)
-            else:
-                delay = min(30, BASE_RETRY_DELAY * (2 ** (attempt - 1)))
-                logging.warning(f"API call failed (attempt {attempt}/{MAX_RETRIES}): {e}. Retrying in {delay:.1f}s")
-                time.sleep(delay)
-    raise last_err
-
-
 def save_data():
     try:
         with data_lock:
             serializable = {str(k): v for k, v in user_data.items()}
-
-        with open(TEMP_FILE, "w", encoding="utf-8") as f:
-            json.dump(serializable, f, ensure_ascii=False, indent=2)
-
-        if os.path.exists(DATA_FILE):
-            try:
-                shutil.copyfile(DATA_FILE, BACKUP_FILE)
-            except Exception as e:
-                logging.warning(f"Backup copy failed: {e}")
-
-        os.replace(TEMP_FILE, DATA_FILE)
-
+            with open(TEMP_FILE, "w", encoding="utf-8") as f:
+                json.dump(serializable, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.exists(DATA_FILE):
+                try:
+                    shutil.copyfile(DATA_FILE, BACKUP_FILE)
+                except Exception as e:
+                    logging.warning(f"Backup file copy failed: {e}")
+            os.replace(TEMP_FILE, DATA_FILE)
     except Exception as e:
         logging.error(f"Save data error: {e}")
 
 
 def load_data():
     global user_data
-
     try:
-        path = DATA_FILE if os.path.exists(DATA_FILE) else BACKUP_FILE if os.path.exists(BACKUP_FILE) else None
-        if not path:
-            user_data = {}
+        raw = None
+        target_path = None
+        if os.path.exists(DATA_FILE):
+            try:
+                with open(DATA_FILE, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                target_path = DATA_FILE
+            except Exception as e:
+                logging.error(f"Failed to load primary data file {DATA_FILE}: {e}")
+
+        if raw is None and os.path.exists(BACKUP_FILE):
+            try:
+                with open(BACKUP_FILE, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                target_path = BACKUP_FILE
+            except Exception as e:
+                logging.error(f"Failed to load backup data file {BACKUP_FILE}: {e}")
+
+        if raw is None:
+            with data_lock:
+                user_data = {}
             return
 
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-
         fixed = {}
-
         for uid_str, value in raw.items():
-            uid = int(uid_str)
+            try:
+                uid = int(uid_str)
+            except ValueError:
+                continue
             base = default_user_state()
-
             if isinstance(value, dict):
                 for k in base:
                     if k in value:
                         base[k] = value[k]
-
-            if not isinstance(base.get("thumbs"), dict):
-                base["thumbs"] = {slot: None for slot in THUMB_SLOTS}
-
-            for slot in THUMB_SLOTS:
-                base["thumbs"].setdefault(slot, None)
-
-            base["selected_channels"] = normalize_selected_channels(base.get("selected_channels"))
-
+                if not isinstance(base.get("thumbs"), dict):
+                    base["thumbs"] = {slot: None for slot in THUMB_SLOTS}
+                for slot in THUMB_SLOTS:
+                    base["thumbs"].setdefault(slot, None)
+                if not isinstance(base.get("selected_channels"), list):
+                    base["selected_channels"] = []
             fixed[uid] = base
 
-        user_data = fixed
-        logging.info("User data loaded successfully")
-
+        with data_lock:
+            user_data = fixed
+        logging.info(f"User data loaded successfully from {target_path}")
     except Exception as e:
         logging.error(f"Load data error: {e}")
-        user_data = {}
+        with data_lock:
+            user_data = {}
 
 
 def is_admin(uid):
-    try:
-        return int(uid) in ADMIN_IDS
-    except Exception:
-        return False
+    return uid in ADMIN_IDS
 
 
 def init_user(uid):
-    with get_state_lock(uid):
-        if uid not in user_data:
-            with data_lock:
-                if uid not in user_data:
-                    user_data[uid] = default_user_state()
-                    save_data()
-        else:
-            state = user_data[uid]
-            state["selected_channels"] = normalize_selected_channels(state.get("selected_channels"))
-            if not isinstance(state.get("thumbs"), dict):
-                state["thumbs"] = {slot: None for slot in THUMB_SLOTS}
+    if uid not in user_data:
+        with data_lock:
+            if uid not in user_data:
+                user_data[uid] = default_user_state()
+        save_data()
 
 
 def safe_text(text):
@@ -211,12 +186,10 @@ def extract_links(text):
 def unique_keep_order(items):
     seen = set()
     out = []
-
     for item in items:
         if item not in seen:
             seen.add(item)
             out.append(item)
-
     return out
 
 
@@ -225,129 +198,96 @@ def has_malayalam(text):
 
 
 def only_symbols_or_emoji(line):
-    return bool(re.fullmatch(
-        r"[\W_🔥💥⚜️❤️✅🥰😍😘💎✨⭐🎉💯😂🤣🙏👉📌📍📢•○●◇◆■□~`|]+",
-        line or ""
-    ))
+    return bool(re.fullmatch(r"[\W_]+", line or ""))
 
 
 def build_links(links):
     links = unique_keep_order(links)
-
     if not links:
         return ""
-
-    result = ["FULL VIDEO 🌝🌸"]
-
+    result = ["FULL VIDEO\n"]
     for i, link in enumerate(links, 1):
         result.append(f"VIDEO {i}\n{link}")
-
     return "\n\n".join(result).strip()
 
 
 def build_links_simple(links):
     links = unique_keep_order(links)
-
     if not links:
         return ""
-
     result = []
-
     for i, link in enumerate(links, 1):
         result.append(f"VIDEO {i}\n{link}")
-
     return "\n\n".join(result).strip()
 
 
 def clean_malayalam_text(text):
     lines = (text or "").splitlines()
     cleaned = []
-
     promo_words = [
         "join", "telegram", "whatsapp", "subscribe", "follow",
         "watch video", "channel",
         "കൂടുതൽ", "ചാനൽ", "സബ്സ്ക്രൈബ്", "ഫോളോ",
-        "ലൈക്ക്", "ലൈക്കുകൾ", "ഷെയർ", "കമന്റ്",
-        "ഞങ്ങളുടെ", "നമ്മുടെ", "ഉഷാർ", "പരിപാടി"
+        "ലൈക്‌ക്", "ലൈക്‌കുകൾ", "ഷെയർ", "കമന്റ്",
+        "ഞങ്‌ങളുടെ", "നമ്‌മുടെ", "ഉഷാർ", "പരിപാടി"
     ]
-
     for raw in lines:
         line = normalize_line(raw)
         low = line.lower()
-
         if not line:
             continue
-
         if re.search(r"https?://", line):
             continue
-
         if re.match(r"^\d+[\).\s]", line):
             continue
-
         if only_symbols_or_emoji(line):
             continue
-
         if any(w in low for w in promo_words):
             continue
-
         if has_malayalam(line):
             cleaned.append(line)
-
     return unique_keep_order(cleaned)
 
 
 def middle_text_filter(text):
     mal_lines = clean_malayalam_text(text)
-
     if len(mal_lines) >= 2:
         return mal_lines[1:]
-
     return mal_lines
 
 
 def text_edit(uid, text):
     mal_lines = clean_malayalam_text(text)
     links = extract_links(text)
-
     parts = []
-
     if mal_lines:
         parts.append("\n".join(mal_lines).strip())
-
     if links:
         parts.append(build_links_simple(links))
-
     final = "\n\n".join(parts).strip()
-
     if not final:
         final = (text or "").strip()
-
     return safe_text(final)
 
 
 def apply_processing(uid, text):
     text = text or ""
     links = extract_links(text)
-
     if user_data[uid].get("arrange_mode"):
         if links:
             return safe_text(build_links(links))
         return safe_text(text.strip())
 
-    if user_data[uid]["text_edit_mode"]:
+    if user_data[uid].get("text_edit_mode"):
         return text_edit(uid, text)
 
-    if user_data[uid]["middle_mode"]:
+    if user_data[uid].get("middle_mode"):
         mal = middle_text_filter(text)
-
         parts = []
-
         if mal:
             parts.append("\n".join(mal))
-
         if links:
             parts.append(build_links_simple(links))
-
         final = "\n\n".join(parts).strip()
         return safe_text(final if final else text.strip())
 
@@ -355,7 +295,7 @@ def apply_processing(uid, text):
 
 
 def get_thumb(uid):
-    slot = user_data[uid]["selected_thumb"]
+    slot = user_data[uid].get("selected_thumb")
     if not slot:
         return None
     return user_data[uid]["thumbs"].get(slot)
@@ -364,21 +304,59 @@ def get_thumb(uid):
 def selected_channel_names(uid):
     return [
         name for name, cid in CHANNELS.items()
-        if cid in user_data[uid]["selected_channels"]
+        if cid in user_data[uid].get("selected_channels", [])
     ]
+
+
+def api_call_retry(func, *args, **kwargs):
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except ApiTelegramException as e:
+            if e.error_code == 429:
+                retry_after = 3
+                try:
+                    retry_after = int(e.result_json.get("parameters", {}).get("retry_after", 3))
+                except Exception:
+                    pass
+                logging.warning(f"Telegram FloodWait 429: Retrying after {retry_after}s")
+                time.sleep(retry_after + 1)
+            elif e.error_code in (500, 502, 503, 504):
+                logging.warning(f"Telegram server error {e.error_code}, retry attempt {attempt + 1}")
+                time.sleep(2 * (attempt + 1))
+            else:
+                logging.error(f"ApiTelegramException in {func.__name__}: {e}")
+                raise e
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logging.warning(f"Network error in {func.__name__}: {e}. Retrying ({attempt + 1}/{max_retries})...")
+                time.sleep(2 * (attempt + 1))
+            else:
+                logging.error(f"Final error in {func.__name__}: {e}")
+                raise e
+    return None
 
 
 def send_message_safe(chat_id, text, reply_markup=None):
     try:
-        return safe_api_call(bot.send_message, chat_id, safe_text(text), reply_markup=reply_markup)
+        return api_call_retry(bot.send_message, chat_id, safe_text(text), reply_markup=reply_markup)
     except Exception as e:
         logging.error(f"Send message error to {chat_id}: {e}")
         return None
 
 
+def reply_safe(m, text, reply_markup=None):
+    try:
+        return api_call_retry(bot.reply_to, m, safe_text(text), reply_markup=reply_markup)
+    except Exception as e:
+        logging.warning(f"Reply error, falling back to send_message: {e}")
+        return send_message_safe(m.chat.id, text, reply_markup=reply_markup)
+
+
 def send_photo_safe(chat_id, photo, caption="", reply_markup=None):
     try:
-        return safe_api_call(
+        return api_call_retry(
             bot.send_photo,
             chat_id,
             photo,
@@ -392,7 +370,7 @@ def send_photo_safe(chat_id, photo, caption="", reply_markup=None):
 
 def send_video_safe(chat_id, video, caption="", reply_markup=None):
     try:
-        return safe_api_call(
+        return api_call_retry(
             bot.send_video,
             chat_id,
             video,
@@ -406,7 +384,7 @@ def send_video_safe(chat_id, video, caption="", reply_markup=None):
 
 def send_document_safe(chat_id, document, caption="", reply_markup=None):
     try:
-        return safe_api_call(
+        return api_call_retry(
             bot.send_document,
             chat_id,
             document,
@@ -420,7 +398,7 @@ def send_document_safe(chat_id, document, caption="", reply_markup=None):
 
 def send_animation_safe(chat_id, animation, caption="", reply_markup=None):
     try:
-        return safe_api_call(
+        return api_call_retry(
             bot.send_animation,
             chat_id,
             animation,
@@ -441,55 +419,45 @@ def report_forward_error(uid, channel_id, err):
 
 
 def forward_to_channels_text(uid, text):
-    if not user_data[uid]["auto_forward"]:
+    if not user_data[uid].get("auto_forward"):
         return
-
-    channels = unique_keep_order(normalize_selected_channels(user_data[uid].get("selected_channels")))
-    for ch in channels:
+    for ch in user_data[uid].get("selected_channels", []):
         msg = send_message_safe(ch, text)
         if not msg:
             report_forward_error(uid, ch, "Send message failed")
 
 
 def forward_to_channels_photo(uid, photo, caption=""):
-    if not user_data[uid]["auto_forward"]:
+    if not user_data[uid].get("auto_forward"):
         return
-
-    channels = unique_keep_order(normalize_selected_channels(user_data[uid].get("selected_channels")))
-    for ch in channels:
+    for ch in user_data[uid].get("selected_channels", []):
         msg = send_photo_safe(ch, photo, caption)
         if not msg:
             report_forward_error(uid, ch, "Send photo failed")
 
 
 def forward_to_channels_video(uid, video, caption=""):
-    if not user_data[uid]["auto_forward"]:
+    if not user_data[uid].get("auto_forward"):
         return
-
-    channels = unique_keep_order(normalize_selected_channels(user_data[uid].get("selected_channels")))
-    for ch in channels:
+    for ch in user_data[uid].get("selected_channels", []):
         msg = send_video_safe(ch, video, caption)
         if not msg:
             report_forward_error(uid, ch, "Send video failed")
 
 
 def forward_to_channels_document(uid, document, caption=""):
-    if not user_data[uid]["auto_forward"]:
+    if not user_data[uid].get("auto_forward"):
         return
-
-    channels = unique_keep_order(normalize_selected_channels(user_data[uid].get("selected_channels")))
-    for ch in channels:
+    for ch in user_data[uid].get("selected_channels", []):
         msg = send_document_safe(ch, document, caption)
         if not msg:
             report_forward_error(uid, ch, "Send document failed")
 
 
 def forward_to_channels_animation(uid, animation, caption=""):
-    if not user_data[uid]["auto_forward"]:
+    if not user_data[uid].get("auto_forward"):
         return
-
-    channels = unique_keep_order(normalize_selected_channels(user_data[uid].get("selected_channels")))
-    for ch in channels:
+    for ch in user_data[uid].get("selected_channels", []):
         msg = send_animation_safe(ch, animation, caption)
         if not msg:
             report_forward_error(uid, ch, "Send animation failed")
@@ -497,14 +465,14 @@ def forward_to_channels_animation(uid, animation, caption=""):
 
 def main_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("📸 Set Thumb", "✅ Use Thumb")
-    kb.row("🖼 Thumb ON", "🖼 Thumb OFF")
-    kb.row("🔗 Arrange ON", "🔗 Arrange OFF")
-    kb.row("📝 Text Edit ON", "📝 Text Edit OFF")
-    kb.row("🎯 Middle ON", "🎯 Middle OFF")
-    kb.row("📢 Select Channel")
-    kb.row("🟢 Auto Forward ON", "🔴 Auto Forward OFF")
-    kb.row("👁 Current Thumb", "📊 Current Settings")
+    kb.row("Set Thumb", "Use Thumb")
+    kb.row("Thumb ON", "Thumb OFF")
+    kb.row("Arrange ON", "Arrange OFF")
+    kb.row("Text Edit ON", "Text Edit OFF")
+    kb.row("Middle ON", "Middle OFF")
+    kb.row("Select Channel")
+    kb.row("Auto Forward ON", "Auto Forward OFF")
+    kb.row("Current Thumb", "Current Settings")
     return kb
 
 
@@ -512,7 +480,7 @@ def slot_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("Photo 1", "Photo 2")
     kb.row("Photo 3", "Photo 4")
-    kb.row("⬅️ Back")
+    kb.row("Back")
     return kb
 
 
@@ -521,343 +489,339 @@ def channel_kb():
     kb.row("Channel 1", "Channel 2")
     kb.row("Channel 3", "Channel 4")
     kb.row("Channel 5")
-    kb.row("✅ Done", "🗑 Clear Channels")
-    kb.row("⬅️ Back")
+    kb.row("Done", "Clear Channels")
+    kb.row("Back")
     return kb
 
 
-
-
-def log_update(message):
-    try:
-        ctype = getattr(message, "content_type", None)
-        uid = getattr(getattr(message, "from_user", None), "id", None)
-        chat_id = getattr(getattr(message, "chat", None), "id", None)
-        mid = getattr(message, "message_id", None)
-        logger.info(f"Incoming update | chat_id={chat_id} | user_id={uid} | message_id={mid} | content_type={ctype}")
-        return message
-    except Exception:
-        logger.exception("Failed to log incoming update")
-        return message
-
 @bot.message_handler(commands=["start"])
 def start(m):
-    log_update(m)
-
-    uid = m.from_user.id
-    init_user(uid)
-
-    if not is_admin(uid):
-        bot.reply_to(m, "❌ Admin only bot")
+    if is_duplicate_msg(m):
         return
+    uid = m.from_user.id
+    if not is_admin(uid):
+        reply_safe(m, "❌ Admin only bot")
+        return
+    init_user(uid)
+    send_message_safe(
+        m.chat.id,
+        "CLEAN VIP BOT READY ✅\n\n"
+        "Arrange:\n"
+        "FULL VIDEO 🍿\n\n"
+        "VIDEO 1\n"
+        "link\n\n"
+        "Text Edit:\n"
+        "Caption\n\n"
+        "VIDEO 1\n"
+        "link",
+        reply_markup=main_kb()
+    )
 
-    bot.reply_to(m, "✅ BOT WORKING")
 
-
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "📸 Set Thumb")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Set Thumb")
 def set_thumb(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-    user_data[uid]["thumb_action"] = "set"
+    with data_lock:
+        user_data[uid]["thumb_action"] = "set"
     save_data()
-    send_message_safe(m.chat.id, "Save ചെയ്യാൻ slot select ചെയ്യൂ", reply_markup=slot_kb())
+    send_message_safe(m.chat.id, "Save slot select 👇", reply_markup=slot_kb())
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "✅ Use Thumb")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Use Thumb")
 def use_thumb(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-    user_data[uid]["thumb_action"] = "use"
+    with data_lock:
+        user_data[uid]["thumb_action"] = "use"
     save_data()
-    send_message_safe(m.chat.id, "Use ചെയ്യാൻ slot select ചെയ്യൂ", reply_markup=slot_kb())
+    send_message_safe(m.chat.id, "Use slot select 👇", reply_markup=slot_kb())
 
 
 @bot.message_handler(func=lambda m: m.content_type == "text" and m.text in THUMB_SLOTS)
 def thumb_slot(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
     slot = m.text
-    action = user_data[uid]["thumb_action"]
-
+    action = user_data[uid].get("thumb_action")
     if action == "set":
-        user_data[uid]["waiting_thumb"] = slot
+        with data_lock:
+            user_data[uid]["waiting_thumb"] = slot
         save_data()
         send_message_safe(
             m.chat.id,
-            f"{slot} ലേക്ക് save ചെയ്യാൻ photo അയക്കൂ 📸",
+            f"📸 {slot} ലേക്ക് save ചെയ്യാൻ photo അയക്കൂ",
             reply_markup=slot_kb()
         )
         return
-
     if action == "use":
         if user_data[uid]["thumbs"].get(slot):
-            user_data[uid]["selected_thumb"] = slot
-            user_data[uid]["thumb_action"] = None
+            with data_lock:
+                user_data[uid]["selected_thumb"] = slot
+                user_data[uid]["thumb_action"] = None
             save_data()
-            send_message_safe(m.chat.id, f"{slot} selected ✅", reply_markup=main_kb())
+            send_message_safe(m.chat.id, f"✅ {slot} selected", reply_markup=main_kb())
         else:
-            send_message_safe(m.chat.id, f"{slot} il thumb ഇല്ല ❌", reply_markup=slot_kb())
+            send_message_safe(m.chat.id, f"❌ {slot} il thumb ഇല്ല", reply_markup=slot_kb())
         return
+    send_message_safe(m.chat.id, "Set/Use Thumb തിരഞ്ഞെടുക്കൂ 👆", reply_markup=main_kb())
 
-    send_message_safe(m.chat.id, "ആദ്യം Set/Use Thumb ചെയ്യൂ", reply_markup=main_kb())
 
-
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "👁 Current Thumb")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Current Thumb")
 def current_thumb(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
     thumb = get_thumb(uid)
-    slot = user_data[uid]["selected_thumb"]
-
+    slot = user_data[uid].get("selected_thumb")
     if not thumb:
-        send_message_safe(m.chat.id, "Current thumb ഇല്ല ❌", reply_markup=main_kb())
+        send_message_safe(m.chat.id, "Current thumb selected: None ❌", reply_markup=main_kb())
         return
-
     send_photo_safe(m.chat.id, thumb, caption=f"Current Thumb: {slot} ✅", reply_markup=main_kb())
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🖼 Thumb ON")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Thumb ON")
 def thumb_on(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-
-    if not user_data[uid]["selected_thumb"]:
-        send_message_safe(m.chat.id, "ആദ്യം thumb select ചെയ്യൂ ❌", reply_markup=main_kb())
+    if not user_data[uid].get("selected_thumb"):
+        send_message_safe(m.chat.id, "thumb select ചെയ്യൂ ❌", reply_markup=main_kb())
         return
-
-    user_data[uid]["thumb_mode"] = True
+    with data_lock:
+        user_data[uid]["thumb_mode"] = True
     save_data()
-    bot.reply_to(m, "Thumb ON ✅")
+    reply_safe(m, "Thumb ON ✅")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🖼 Thumb OFF")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Thumb OFF")
 def thumb_off(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-    user_data[uid]["thumb_mode"] = False
+    with data_lock:
+        user_data[uid]["thumb_mode"] = False
     save_data()
-    bot.reply_to(m, "Thumb OFF ❌")
+    reply_safe(m, "Thumb OFF ❌")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🔗 Arrange ON")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Arrange ON")
 def arrange_on(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-    user_data[uid]["arrange_mode"] = True
-    user_data[uid]["text_edit_mode"] = False
-    user_data[uid]["middle_mode"] = False
+    with data_lock:
+        user_data[uid]["arrange_mode"] = True
+        user_data[uid]["text_edit_mode"] = False
+        user_data[uid]["middle_mode"] = False
     save_data()
-    bot.reply_to(m, "Arrange ON ✅")
+    reply_safe(m, "Arrange ON ✅")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🔗 Arrange OFF")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Arrange OFF")
 def arrange_off(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-    user_data[uid]["arrange_mode"] = False
+    with data_lock:
+        user_data[uid]["arrange_mode"] = False
     save_data()
-    bot.reply_to(m, "Arrange OFF ❌")
+    reply_safe(m, "Arrange OFF ❌")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "📝 Text Edit ON")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Text Edit ON")
 def text_edit_on(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-    user_data[uid]["text_edit_mode"] = True
-    user_data[uid]["middle_mode"] = False
-    user_data[uid]["arrange_mode"] = False
+    with data_lock:
+        user_data[uid]["text_edit_mode"] = True
+        user_data[uid]["middle_mode"] = False
+        user_data[uid]["arrange_mode"] = False
     save_data()
-    bot.reply_to(m, "Text Edit ON ✅")
+    reply_safe(m, "Text Edit ON ✅")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "📝 Text Edit OFF")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Text Edit OFF")
 def text_edit_off(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-    user_data[uid]["text_edit_mode"] = False
+    with data_lock:
+        user_data[uid]["text_edit_mode"] = False
     save_data()
-    bot.reply_to(m, "Text Edit OFF ❌")
+    reply_safe(m, "Text Edit OFF ❌")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🎯 Middle ON")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Middle ON")
 def middle_on(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-    user_data[uid]["middle_mode"] = True
-    user_data[uid]["text_edit_mode"] = False
-    user_data[uid]["arrange_mode"] = False
+    with data_lock:
+        user_data[uid]["middle_mode"] = True
+        user_data[uid]["text_edit_mode"] = False
+        user_data[uid]["arrange_mode"] = False
     save_data()
-    bot.reply_to(m, "Middle ON ✅")
+    reply_safe(m, "Middle ON ✅")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🎯 Middle OFF")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Middle OFF")
 def middle_off(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-    user_data[uid]["middle_mode"] = False
+    with data_lock:
+        user_data[uid]["middle_mode"] = False
     save_data()
-    bot.reply_to(m, "Middle OFF ❌")
+    reply_safe(m, "Middle OFF ❌")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "📢 Select Channel")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Select Channel")
 def select_channel(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-    send_message_safe(m.chat.id, "Channels select ചെയ്യൂ 👇", reply_markup=channel_kb())
+    send_message_safe(m.chat.id, "Channels select 👇", reply_markup=channel_kb())
 
 
 @bot.message_handler(func=lambda m: m.content_type == "text" and m.text in CHANNELS.keys())
 def toggle_channel(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
     cid = CHANNELS[m.text]
-
-    with get_state_lock(uid):
-        current = normalize_selected_channels(user_data[uid].get("selected_channels"))
-        if cid in current:
-            current = [x for x in current if x != cid]
-            user_data[uid]["selected_channels"] = current
-            save_data()
-            send_message_safe(m.chat.id, f"{m.text} removed ❌", reply_markup=channel_kb())
+    with data_lock:
+        if cid in user_data[uid]["selected_channels"]:
+            user_data[uid]["selected_channels"].remove(cid)
+            msg_text = f"❌ {m.text} removed"
         else:
-            current.append(cid)
-            user_data[uid]["selected_channels"] = unique_keep_order(current)
-            save_data()
-            send_message_safe(m.chat.id, f"{m.text} added ✅", reply_markup=channel_kb())
+            user_data[uid]["selected_channels"].append(cid)
+            msg_text = f"✅ {m.text} added"
+    save_data()
+    send_message_safe(m.chat.id, msg_text, reply_markup=channel_kb())
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "✅ Done")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Done")
 def done_channels(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     send_message_safe(m.chat.id, "Channels saved ✅", reply_markup=main_kb())
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🗑 Clear Channels")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Clear Channels")
 def clear_channels(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-    user_data[uid]["selected_channels"] = []
+    with data_lock:
+        user_data[uid]["selected_channels"] = []
     save_data()
-    send_message_safe(m.chat.id, "Channels cleared ✅", reply_markup=channel_kb())
+    send_message_safe(m.chat.id, "Channels cleared 🧹", reply_markup=channel_kb())
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "⬅️ Back")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Back")
 def back_btn(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
+    send_message_safe(m.chat.id, "Main menu 🔙", reply_markup=main_kb())
 
-    send_message_safe(m.chat.id, "Main menu ✅", reply_markup=main_kb())
 
-
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🟢 Auto Forward ON")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Auto Forward ON")
 def auto_forward_on(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-
-    if not user_data[uid]["selected_channels"]:
-        send_message_safe(m.chat.id, "ആദ്യം channel select ചെയ്യൂ ❌", reply_markup=channel_kb())
+    if not user_data[uid].get("selected_channels"):
+        send_message_safe(m.chat.id, "channel select ചെയ്യൂ ❌", reply_markup=channel_kb())
         return
-
-    user_data[uid]["auto_forward"] = True
+    with data_lock:
+        user_data[uid]["auto_forward"] = True
     save_data()
-    bot.reply_to(m, "Auto Forward ON ✅")
+    reply_safe(m, "Auto Forward ON ✅")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "🔴 Auto Forward OFF")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Auto Forward OFF")
 def auto_forward_off(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-    user_data[uid]["auto_forward"] = False
+    with data_lock:
+        user_data[uid]["auto_forward"] = False
     save_data()
-    bot.reply_to(m, "Auto Forward OFF ❌")
+    reply_safe(m, "Auto Forward OFF ❌")
 
 
-@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "📊 Current Settings")
+@bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "Current Settings")
 def current_settings(m):
-    log_update(m)
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-
     channel_names = selected_channel_names(uid)
     channel_text = "\n".join(channel_names) if channel_names else "None ❌"
-
     text = (
         f"Thumb Mode: {'ON ✅' if user_data[uid]['thumb_mode'] else 'OFF ❌'}\n"
         f"Arrange Mode: {'ON ✅' if user_data[uid]['arrange_mode'] else 'OFF ❌'}\n"
@@ -867,190 +831,158 @@ def current_settings(m):
         f"Selected Thumb: {user_data[uid]['selected_thumb'] or 'None ❌'}\n\n"
         f"Selected Channels:\n{channel_text}"
     )
-
     send_message_safe(m.chat.id, text, reply_markup=main_kb())
 
 
 @bot.message_handler(content_types=["photo"])
 def photo_handler(m):
-    log_update(m)
-    logger.info(f"Photo received | user_id={m.from_user.id} | chat_id={m.chat.id} | message_id={m.message_id}")
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-
     try:
         photo_id = m.photo[-1].file_id
         caption = m.caption or ""
-        logging.info(f"Photo received from {uid}, caption_len={len(caption)}")
-
-        if user_data[uid]["waiting_thumb"]:
+        if user_data[uid].get("waiting_thumb"):
             slot = user_data[uid]["waiting_thumb"]
-            user_data[uid]["thumbs"][slot] = photo_id
-            user_data[uid]["waiting_thumb"] = None
-            user_data[uid]["thumb_action"] = None
+            with data_lock:
+                user_data[uid]["thumbs"][slot] = photo_id
+                user_data[uid]["waiting_thumb"] = None
+                user_data[uid]["thumb_action"] = None
             save_data()
             send_message_safe(m.chat.id, f"{slot} saved ✅", reply_markup=main_kb())
             return
 
-        send_photo_id = get_thumb(uid) if user_data[uid]["thumb_mode"] else photo_id
+        send_photo_id = get_thumb(uid) if user_data[uid].get("thumb_mode") else photo_id
         if not send_photo_id:
             send_photo_id = photo_id
 
         final_caption = apply_processing(uid, caption)
-
         send_photo_safe(m.chat.id, send_photo_id, caption=final_caption, reply_markup=main_kb())
         forward_to_channels_photo(uid, send_photo_id, final_caption)
-
     except Exception as e:
-        logger.exception("Photo handler error")
-        send_message_safe(m.chat.id, "Photo process ചെയ്യാൻ പറ്റിയില്ല ❌", reply_markup=main_kb())
+        logging.error(f"Photo handler error: {e}")
+        send_message_safe(m.chat.id, "Photo process error ❌", reply_markup=main_kb())
 
 
 @bot.message_handler(content_types=["video"])
 def video_handler(m):
-    log_update(m)
-    logger.info(f"Video received | user_id={m.from_user.id} | chat_id={m.chat.id} | message_id={m.message_id}")
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-
     try:
         video_id = m.video.file_id
         caption = m.caption or ""
-        logging.info(f"Video received from {uid}, caption_len={len(caption)}")
         final_caption = apply_processing(uid, caption)
-
         send_video_safe(m.chat.id, video_id, caption=final_caption, reply_markup=main_kb())
         forward_to_channels_video(uid, video_id, final_caption)
-
     except Exception as e:
-        logger.exception("Video handler error")
-        send_message_safe(m.chat.id, "Video process ചെയ്യാൻ പറ്റിയില്ല ❌", reply_markup=main_kb())
+        logging.error(f"Video handler error: {e}")
+        send_message_safe(m.chat.id, "Video process error ❌", reply_markup=main_kb())
 
 
 @bot.message_handler(content_types=["document"])
 def document_handler(m):
-    log_update(m)
-    logger.info(f"Document received | user_id={m.from_user.id} | chat_id={m.chat.id} | message_id={m.message_id}")
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-
     try:
         doc_id = m.document.file_id
         caption = m.caption or ""
-        logging.info(f"Document received from {uid}, caption_len={len(caption)}")
         final_caption = apply_processing(uid, caption)
-
         send_document_safe(m.chat.id, doc_id, caption=final_caption, reply_markup=main_kb())
         forward_to_channels_document(uid, doc_id, final_caption)
-
     except Exception as e:
-        logger.exception("Document handler error")
-        send_message_safe(m.chat.id, "Document process ചെയ്യാൻ പറ്റിയില്ല ❌", reply_markup=main_kb())
+        logging.error(f"Document handler error: {e}")
+        send_message_safe(m.chat.id, "Document process error ❌", reply_markup=main_kb())
 
 
 @bot.message_handler(content_types=["animation"])
 def animation_handler(m):
-    log_update(m)
-    logger.info(f"Animation received | user_id={m.from_user.id} | chat_id={m.chat.id} | message_id={m.message_id}")
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-
     try:
         anim_id = m.animation.file_id
         caption = m.caption or ""
-        logging.info(f"Animation received from {uid}, caption_len={len(caption)}")
         final_caption = apply_processing(uid, caption)
-
         send_animation_safe(m.chat.id, anim_id, caption=final_caption, reply_markup=main_kb())
         forward_to_channels_animation(uid, anim_id, final_caption)
-
     except Exception as e:
-        logger.exception("Animation handler error")
-        send_message_safe(m.chat.id, "Animation process ചെയ്യാൻ പറ്റിയില്ല ❌", reply_markup=main_kb())
+        logging.error(f"Animation handler error: {e}")
+        send_message_safe(m.chat.id, "Animation process error ❌", reply_markup=main_kb())
 
 
 @bot.message_handler(content_types=["text"])
 def text_handler(m):
-    log_update(m)
-    logger.info(f"Text message received | user_id={m.from_user.id} | chat_id={m.chat.id} | message_id={m.message_id} | text={m.text!r}")
+    if is_duplicate_msg(m):
+        return
     uid = m.from_user.id
     if not is_admin(uid):
         return
-
     init_user(uid)
-
     ignore = {
-        "📸 Set Thumb", "✅ Use Thumb",
-        "🖼 Thumb ON", "🖼 Thumb OFF",
-        "🔗 Arrange ON", "🔗 Arrange OFF",
-        "📝 Text Edit ON", "📝 Text Edit OFF",
-        "🎯 Middle ON", "🎯 Middle OFF",
-        "📢 Select Channel",
-        "🟢 Auto Forward ON", "🔴 Auto Forward OFF",
-        "👁 Current Thumb", "📊 Current Settings",
+        "Set Thumb", "Use Thumb",
+        "Thumb ON", "Thumb OFF",
+        "Arrange ON", "Arrange OFF",
+        "Text Edit ON", "Text Edit OFF",
+        "Middle ON", "Middle OFF",
+        "Select Channel", "Auto Forward ON", "Auto Forward OFF",
+        "Current Thumb", "Current Settings",
         "Channel 1", "Channel 2", "Channel 3", "Channel 4", "Channel 5",
-        "✅ Done", "🗑 Clear Channels", "⬅️ Back",
+        "Done", "Clear Channels", "Back",
         "Photo 1", "Photo 2", "Photo 3", "Photo 4",
     }
-
     if m.text in ignore:
         return
-
     try:
-        logging.info(f"Text received from {uid}, len={len(m.text or '')}")
         final_text = apply_processing(uid, m.text)
-
         send_message_safe(
             m.chat.id,
             final_text if final_text else "Empty text ❌",
             reply_markup=main_kb()
         )
-
         if final_text:
             forward_to_channels_text(uid, final_text)
-
     except Exception as e:
-        logger.exception("Text handler error")
-        send_message_safe(m.chat.id, "Text process ചെയ്യാൻ പറ്റിയില്ല ❌", reply_markup=main_kb())
+        logging.error(f"Text handler error: {e}")
+        send_message_safe(m.chat.id, "Text process error ❌", reply_markup=main_kb())
 
 
 def run_bot():
-    delay = 5
+    backoff = 1
     while True:
         try:
             logging.info("Bot running...")
             try:
-                bot.remove_webhook(drop_pending_updates=True)
-            except TypeError:
-                try:
-                    bot.remove_webhook()
-                except Exception as e:
-                    logging.warning(f"remove_webhook failed: {e}")
+                bot.remove_webhook()
+            except Exception as e:
+                logging.warning(f"Remove webhook warning: {e}")
+            backoff = 1
             bot.infinity_polling(
                 skip_pending=True,
                 timeout=30,
                 long_polling_timeout=30
             )
-            delay = 5
         except Exception as e:
-            logging.error(f"Polling crash: {e}", exc_info=True)
-            time.sleep(delay)
-            delay = min(delay * 2, 60)
+            logging.error(f"Polling crash: {e}")
+            logging.info(f"Reconnecting in {backoff} seconds...")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
 
 
 if __name__ == "__main__":
-    logging.info("Starting bot process")
     load_data()
     run_bot()
+
