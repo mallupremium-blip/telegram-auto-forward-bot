@@ -543,28 +543,15 @@ def log_update(message):
 @bot.message_handler(commands=["start"])
 def start(m):
     log_update(m)
-    logger.info(f"/start handler | user_id={m.from_user.id} | chat_id={m.chat.id}")
-    uid = m.from_user.id
 
+    uid = m.from_user.id
     init_user(uid)
 
     if not is_admin(uid):
-        send_message_safe(m.chat.id, "❌ Admin only bot", reply_markup=main_kb())
+        bot.reply_to(m, "❌ Admin only bot")
         return
 
-    send_message_safe(
-        m.chat.id,
-        "🔥 CLEAN VIP BOT READY ✅\n\n"
-        "Arrange:\n"
-        "FULL VIDEO 🌝🌸\n\n"
-        "VIDEO 1\n"
-        "link\n\n"
-        "Text Edit:\n"
-        "Caption\n\n"
-        "VIDEO 1\n"
-        "link",
-        reply_markup=main_kb()
-    )
+    bot.reply_to(m, "✅ BOT WORKING")
 
 
 @bot.message_handler(func=lambda m: m.content_type == "text" and m.text == "📸 Set Thumb")
