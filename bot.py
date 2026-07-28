@@ -248,7 +248,7 @@ def build_links(links):
     links = unique_keep_order(links)
     if not links:
         return ""
-    result = ["FULL VIDEO 🍿\n"]
+    result = ["FULL VIDEO 🌝🌸\n"]
     for i, link in enumerate(links, 1):
         result.append(f"VIDEO {i}\n{link}")
     return "\n\n".join(result).strip()
@@ -525,7 +525,7 @@ def start(m):
         m.chat.id,
         "CLEAN VIP BOT READY ✅\n\n"
         "Arrange:\n"
-        "FULL VIDEO 🍿\n\n"
+        "FULL VIDEO 🌝🌸\n\n"
         "VIDEO 1\n"
         "link\n\n"
         "Text Edit:\n"
